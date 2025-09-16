@@ -11,6 +11,172 @@
 
 namespace art_net {
 
+// Forward declarations for universe registry system
+struct UniverseDescriptor;
+struct PortConfiguration;
+struct PortMappingResult;
+template <typename S> class UniverseRegistry;
+
+// Core data structures for universe subscription tracking
+
+struct UniverseDescriptor {
+    uint8_t net;        // 7-bit net (0-127)
+    uint8_t subnet;     // 4-bit subnet (0-15)
+    uint8_t universe;   // 4-bit universe (0-15)
+    uint16_t universe15bit;  // 15-bit combined universe identifier
+    
+    UniverseDescriptor() : net(0), subnet(0), universe(0), universe15bit(0) {}
+    
+    UniverseDescriptor(uint8_t n, uint8_t s, uint8_t u)
+        : net(n), subnet(s), universe(u), universe15bit(((uint16_t)n << 8) | ((uint16_t)s << 4) | (uint16_t)u) {}
+    
+    UniverseDescriptor(uint16_t universe_15bit)
+        : universe15bit(universe_15bit), net((universe_15bit >> 8) & 0x7F),
+          subnet((universe_15bit >> 4) & 0x0F), universe(universe_15bit & 0x0F) {}
+    
+    bool operator<(const UniverseDescriptor& other) const {
+        return universe15bit < other.universe15bit;
+    }
+    
+    bool operator==(const UniverseDescriptor& other) const {
+        return universe15bit == other.universe15bit;
+    }
+};
+
+struct PortConfiguration {
+    uint8_t port_index;         // Physical port index (0-3 for standard Art-Net)
+    UniverseDescriptor universe; // Universe assigned to this port
+    bool input_enabled;         // Port configured for input
+    bool output_enabled;        // Port configured for output
+    uint8_t sw_in;             // Input universe setting for ArtPollReply
+    uint8_t sw_out;            // Output universe setting for ArtPollReply
+    
+    PortConfiguration() : port_index(0), input_enabled(false), output_enabled(false), sw_in(0), sw_out(0) {}
+    
+    PortConfiguration(uint8_t idx, const UniverseDescriptor& univ, bool in, bool out)
+        : port_index(idx), universe(univ), input_enabled(in), output_enabled(out),
+          sw_in(univ.universe), sw_out(univ.universe) {}
+};
+
+struct PortMappingResult {
+    uint8_t num_ports;                    // Number of ports to report
+    PortConfiguration ports[4];           // Port configurations (max 4 ports)
+    bool has_subscriptions;               // True if any universe subscriptions exist
+    
+    PortMappingResult() : num_ports(0), has_subscriptions(false) {
+        // Initialize all ports
+        for (uint8_t i = 0; i < 4; ++i) {
+            ports[i] = PortConfiguration();
+        }
+    }
+};
+
+// Universe Registry for tracking subscriptions and generating port mappings
+template <typename S>
+class UniverseRegistry {
+private:
+#if ARX_HAVE_LIBSTDCPLUSPLUS >= 201103L
+    std::map<uint16_t, UniverseDescriptor> active_universes;
+#else
+    arx::stdx::map<uint16_t, UniverseDescriptor> active_universes;
+#endif
+
+public:
+    // Register a universe subscription
+    void registerUniverse(uint16_t universe15bit) {
+        UniverseDescriptor desc(universe15bit);
+        active_universes[universe15bit] = desc;
+    }
+    
+    void registerUniverse(uint8_t net, uint8_t subnet, uint8_t universe) {
+        if (net > 0x7F || subnet > 0xF || universe > 0xF) return;
+        uint16_t universe15bit = ((uint16_t)net << 8) | ((uint16_t)subnet << 4) | (uint16_t)universe;
+        registerUniverse(universe15bit);
+    }
+    
+    // Unregister a universe subscription
+    void unregisterUniverse(uint16_t universe15bit) {
+        auto it = active_universes.find(universe15bit);
+        if (it != active_universes.end()) {
+            active_universes.erase(it);
+        }
+    }
+    
+    void unregisterUniverse(uint8_t net, uint8_t subnet, uint8_t universe) {
+        if (net > 0x7F || subnet > 0xF || universe > 0xF) return;
+        uint16_t universe15bit = ((uint16_t)net << 8) | ((uint16_t)subnet << 4) | (uint16_t)universe;
+        unregisterUniverse(universe15bit);
+    }
+    
+    // Clear all subscriptions
+    void clear() {
+        active_universes.clear();
+    }
+    
+    // Get number of active universe subscriptions
+    size_t getActiveUniverseCount() const {
+        return active_universes.size();
+    }
+    
+    // Check if a universe is subscribed
+    bool isUniverseSubscribed(uint16_t universe15bit) const {
+        return active_universes.find(universe15bit) != active_universes.end();
+    }
+    
+    // Get list of active universe descriptors
+    void getActiveUniverses(UniverseDescriptor* descriptors, size_t max_count, size_t& actual_count) const {
+        actual_count = 0;
+        for (const auto& pair : active_universes) {
+            if (actual_count < max_count) {
+                descriptors[actual_count] = pair.second;
+                ++actual_count;
+            } else {
+                break;
+            }
+        }
+    }
+    
+    // Generate optimal port mapping based on current subscriptions
+    PortMappingResult generatePortMapping() const {
+        PortMappingResult result;
+        result.has_subscriptions = !active_universes.empty();
+        
+        if (!result.has_subscriptions) {
+            // Default configuration with universe 0 if no subscriptions
+            result.num_ports = 1;
+            result.ports[0] = PortConfiguration(0, UniverseDescriptor(0, 0, 0), true, false);
+            return result;
+        }
+        
+        // Map subscribed universes to ports (up to 4 ports)
+        uint8_t port_idx = 0;
+        for (const auto& pair : active_universes) {
+            if (port_idx >= 4) break;
+            
+            result.ports[port_idx] = PortConfiguration(port_idx, pair.second, true, false);
+            ++port_idx;
+        }
+        
+        result.num_ports = port_idx;
+        return result;
+    }
+    
+    // Sync with existing callback maps from Receiver
+    void syncWithCallbacks(const art_dmx::CallbackMap& dmx_callbacks, const art_nzs::CallbackMap& nzs_callbacks) {
+        clear();
+        
+        // Add all DMX universe subscriptions
+        for (const auto& cb_pair : dmx_callbacks) {
+            registerUniverse(cb_pair.first);
+        }
+        
+        // Add all NZS universe subscriptions
+        for (const auto& cb_pair : nzs_callbacks) {
+            registerUniverse(cb_pair.first);
+        }
+    }
+};
+
 namespace {
 
 struct NoPrint : public Print
@@ -33,6 +199,8 @@ class Receiver_
     art_sync::CallbackType callback_art_sync;
     art_trigger::CallbackType callback_art_trigger;
     ArtPollReplyConfig art_poll_reply_config;
+
+    UniverseRegistry<S> universe_registry;
 
     Print *logger {&no_log};
 
@@ -167,6 +335,7 @@ public:
     -> std::enable_if_t<arx::is_callable<Fn>::value>
     {
         this->callback_art_dmx_universes.insert(std::make_pair(universe, arx::function_traits<Fn>::cast(func)));
+        this->universe_registry.registerUniverse(universe);
     }
 
     // subscribe artnzs packet for specified universe (15 bit)
@@ -175,6 +344,7 @@ public:
     -> std::enable_if_t<arx::is_callable<Fn>::value>
     {
         this->callback_art_nzs_universes.insert(std::make_pair(universe, arx::function_traits<Fn>::cast(func)));
+        this->universe_registry.registerUniverse(universe);
     }
 
     // subscribe artdmx packet for all universes
@@ -211,10 +381,12 @@ public:
         if (it != this->callback_art_dmx_universes.end()) {
             this->callback_art_dmx_universes.erase(it);
         }
+        this->universe_registry.unregisterUniverse(universe);
     }
     void unsubscribeArtDmxUniverses()
     {
         this->callback_art_dmx_universes.clear();
+        this->universe_registry.syncWithCallbacks(this->callback_art_dmx_universes, this->callback_art_nzs_universes);
     }
     void unsubscribeArtDmx()
     {
@@ -227,6 +399,7 @@ public:
         if (it != this->callback_art_nzs_universes.end()) {
             this->callback_art_nzs_universes.erase(it);
         }
+        this->universe_registry.unregisterUniverse(universe);
     }
 
     void unsubscribeArtSync()
@@ -382,24 +555,19 @@ private:
         uint8_t my_mac[6];
         this->macAddress(my_mac);
 
-        arx::stdx::map<uint16_t, bool> universes;
-        for (const auto &cb_pair : this->callback_art_dmx_universes) {
-            universes[cb_pair.first] = true;
-        }
-        for (const auto &cb_pair : this->callback_art_nzs_universes) {
-            universes[cb_pair.first] = true;
-        }
-        // if no universe is subscribed, send reply for universe 0
-        if (universes.empty()) {
-            universes[0] = true;
-        }
-
-        for (const auto &u_pair : universes) {
-            art_poll_reply::Packet reply = art_poll_reply::generatePacketFrom(my_ip, my_mac, u_pair.first, this->art_poll_reply_config);
-            this->stream->beginPacket(remote.ip, DEFAULT_PORT);
-            this->stream->write(reply.b, sizeof(art_poll_reply::Packet));
-            this->stream->endPacket();
-        }
+        // Sync registry with current callbacks to ensure consistency
+        this->universe_registry.syncWithCallbacks(this->callback_art_dmx_universes, this->callback_art_nzs_universes);
+        
+        // Generate port mapping for current subscriptions
+        PortMappingResult port_mapping = this->universe_registry.generatePortMapping();
+        
+        // Generate single consolidated ArtPollReply packet using dynamic port configuration
+        art_poll_reply::Packet reply = art_poll_reply::generatePacketFrom(my_ip, my_mac, port_mapping, this->art_poll_reply_config);
+        
+        // Send single packet instead of multiple packets
+        this->stream->beginPacket(remote.ip, DEFAULT_PORT);
+        this->stream->write(reply.b, sizeof(art_poll_reply::Packet));
+        this->stream->endPacket();
     }
 
     uint16_t getArtTriggerOEM() const

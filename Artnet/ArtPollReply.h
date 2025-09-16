@@ -79,7 +79,10 @@ struct Config
     uint8_t sw_in[4] {0};
 };
 
-inline Packet generatePacketFrom(const IPAddress &my_ip, const uint8_t my_mac[6], uint16_t universe, const Config &metadata)
+// Forward declaration for PortMappingResult
+struct PortMappingResult;
+
+inline Packet generatePacketFrom(const IPAddress &my_ip, const uint8_t my_mac[6], const PortMappingResult& port_mapping, const Config &metadata)
 {
     Packet r;
     for (size_t i = 0; i < ID_LENGTH; i++) {
@@ -108,23 +111,52 @@ inline Packet generatePacketFrom(const IPAddress &my_ip, const uint8_t my_mac[6]
     memcpy(r.long_name, metadata.long_name.c_str(), metadata.long_name.length());
     memcpy(r.node_report, metadata.node_report.c_str(), metadata.node_report.length());
     r.num_ports_h = 0; // Reserved
-    r.num_ports_l = 1;
+    r.num_ports_l = port_mapping.num_ports;
+    
+    // Initialize all port arrays to zero
     memset(r.sw_in, 0, 4);
     memset(r.sw_out, 0, 4);
     memset(r.port_types, 0, 4);
     memset(r.good_input, 0, 4);
     memset(r.good_output, 0, 4);
-    r.net_sw = (universe >> 8) & 0x7F;
-    r.sub_sw = (universe >> 4) & 0x0F;
-    // https://github.com/hideakitai/ArtNet/issues/81
-    // https://github.com/hideakitai/ArtNet/issues/121
-    r.sw_out[0] = (universe >> 0) & 0x0F;
-    for (size_t i = 0; i < 4; ++i) {
-        r.sw_in[i] = metadata.sw_in[i] & 0x0F;
+    
+    // Configure ports based on PortMappingResult
+    // Use primary universe for net/subnet if available, otherwise default to 0
+    uint16_t primary_universe = port_mapping.num_ports > 0 ? port_mapping.ports[0].universe.universe15bit : 0;
+    r.net_sw = (primary_universe >> 8) & 0x7F;
+    r.sub_sw = (primary_universe >> 4) & 0x0F;
+    
+    // Configure each port up to the reported number of ports
+    for (uint8_t i = 0; i < port_mapping.num_ports && i < 4; ++i) {
+        const auto& port = port_mapping.ports[i];
+        
+        // Set sw_in and sw_out based on port configuration
+        r.sw_in[i] = port.sw_in & 0x0F;
+        r.sw_out[i] = port.sw_out & 0x0F;
+        
+        // Configure port types based on input/output capabilities
+        if (port.input_enabled && port.output_enabled) {
+            r.port_types[i] = 0xC0;   // I/O available by DMX512
+        } else if (port.input_enabled) {
+            r.port_types[i] = 0x80;   // Input available by DMX512
+        } else if (port.output_enabled) {
+            r.port_types[i] = 0x40;   // Output available by DMX512
+        } else {
+            r.port_types[i] = 0x00;   // Port disabled
+        }
+        
+        // Set good input/output status
+        r.good_input[i] = port.input_enabled ? 0x80 : 0x00;    // Data received without error if enabled
+        r.good_output[i] = port.output_enabled ? 0x80 : 0x00;  // Data transmitted without error if enabled
     }
-    r.port_types[0] = 0xC0;   // I/O available by DMX512
-    r.good_input[0] = 0x80;   // Data received without error
-    r.good_output[0] = 0x80;  // Data transmitted without error
+    
+    // If no ports configured, still populate sw_in from metadata for backward compatibility
+    if (port_mapping.num_ports == 0) {
+        for (size_t i = 0; i < 4; ++i) {
+            r.sw_in[i] = metadata.sw_in[i] & 0x0F;
+        }
+    }
+    
     r.sw_video = 0;   // Video display shows local data
     r.sw_macro = 0;   // No support for macro key inputs
     r.sw_remote = 0;  // No support for remote trigger inputs
