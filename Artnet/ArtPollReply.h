@@ -3,6 +3,7 @@
 #define ARTNET_ARTPOLLREPLY_H
 
 #include "Common.h"
+#include "Types.h"
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
@@ -78,9 +79,6 @@ struct Config
     //      https://art-net.org.uk/downloads/art-net.pdf
     uint8_t sw_in[4] {0};
 };
-
-// Forward declaration for PortMappingResult
-struct PortMappingResult;
 
 inline Packet generatePacketFrom(const IPAddress &my_ip, const uint8_t my_mac[6], const PortMappingResult& port_mapping, const Config &metadata)
 {
